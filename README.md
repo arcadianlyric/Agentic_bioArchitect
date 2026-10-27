@@ -1,7 +1,7 @@
 ## UMI 16S rRNA Architect
 To build a new project of 16S rRNA from scratch, I created this multi-agent tool to gether domain knowledge and architect project. There are 2 modules: 
 1. multi_agent_architect: a multi-agent general purpose LLM planer for automated workflow architecture design, review and code generation.  
-2. rna_16s: applied the multi_agent_architect to create a actual bioinformatics pipeline implementation (Snakemake workflow + Python scripts). 
+2. rna_16s: the actual bioinformatics pipeline (Snakemake workflow + Python scripts). The final per-UMI design does not come from the agent's output; see [What the Agent Got Wrong](#what-the-agent-got-wrong). 
 
 ## Step1. Multi_agent_architecture  
 
@@ -19,22 +19,20 @@ flowchart TD
         V["Architecture Reviewer"]
         R -->|"tools, papers, benchmarks"| A
         A -->|"workflow design"| V
-        V -->|"score below 7: feedback"| A
     end
 
     HRC{"Human Review Checkpoint"}
-    V -->|"score 7 or higher: pass"| HRC
+    V -->|"scores + verdict (single pass)"| HRC
 
     subgraph Phase2["Phase 2: Coding Module"]
         C["Coder Agent"]
         CR["Code Reviewer"]
         C -->|"implementation"| CR
-        CR -->|"score below 7: fix instructions"| C
     end
 
     OUT["Output: umi_abundance.py + Snakemake rules"]
     HRC -->|"approved"| C
-    CR -->|"score 7 or higher: pass"| OUT
+    CR -->|"scores + verdict (single pass)"| OUT
 
     subgraph Tools["Direct API Tools"]
         T1["Tavily Web Search"]
@@ -79,13 +77,13 @@ The system operates in two phases with a human review checkpoint:
 **Phase 1 -- Architecture Module** (Researcher -> Analyst -> Reviewer)
 1. **Researcher Agent** searches Tavily and PubMed for latest tools/papers on UMI-based 16S clustering.
 2. **Analyst Agent** designs a step-by-step bioinformatics workflow based on findings.
-3. **Architecture Reviewer** scores the design (0-10) and triggers revision if below threshold.
+3. **Architecture Reviewer** scores the design (0-10) and writes a PASS/REVISE verdict. Each crew runs once (`Process.sequential`); a REVISE verdict does not re-run the Analyst.
 
 **Human Review Checkpoint** -- User reviews the approved architecture before proceeding.
 
 **Phase 2 -- Coding Module** (Coder -> code-Reviewer)
 4. **Coder Agent** implements the approved workflow as Python code, integrating with existing `rna_16s.smk`.
-5. **Code Reviewer** validates syntax, logic, edge cases, and integration. Iterates until quality threshold met.
+5. **Code Reviewer** validates syntax, logic, edge cases, and integration, and writes fix instructions. As in Phase 1, there is no automatic re-run.
 
 Each agent's LLM provider is independently configurable (Grok, DeepSeek, OpenAI, Gemini) via `config/agents.yaml`.
 
@@ -153,17 +151,17 @@ The hybrid architecture combines CrewAI for agent lifecycle management with dire
 
 - **CrewAI layer** -- Agent role/goal/backstory definitions, task sequencing, memory persistence, delegation control.
 - **Direct API layer** -- Tavily and PubMed search functions bypass CrewAI's built-in tool system for more control over request formatting, error handling, and response parsing.
-- **LLM abstraction** -- `config.py` provides a unified `call_llm()` function that dispatches to the correct provider based on per-agent configuration. This eliminates shared blind spots when using different LLMs for generation vs review.
+- **LLM abstraction** -- `config.py` provides a unified `call_llm()` function that dispatches to the correct provider based on per-agent configuration. Using different LLMs for generation and review could reduce shared blind spots, but the recorded run used GPT-4o for every agent.
 
 #### Anti-Degradation Measures
 
 | Strategy | Implementation |
 |----------|----------------|
 | Episodic memory | CrewAI built-in memory across tasks within a crew |
-| Reviewer reflection loop | Architecture Reviewer and Code Reviewer trigger re-runs if quality score < 7.0 |
+| Reviewer reflection loop | **Not implemented.** `max_iterations` and `quality_threshold` exist in `agents.yaml` but no code reads them; each crew runs once |
 | Configurable LLM diversity | Different agents can use different LLM providers to reduce shared failure modes |
 | Structured output format | Tasks specify `expected_output` to constrain agent responses |
-| State summarization | Reviewer produces structured scores + specific feedback per iteration |
+| State summarization | Reviewer produces structured scores + specific feedback |
 
 ---
 
@@ -233,7 +231,7 @@ agentic_bioArchitecturer/
 A single LLM call cannot reliably perform the full loop of literature search, workflow design, code generation, and quality review. Each sub-task requires different expertise, tool access, and evaluation criteria. The multi-agent approach:
 
 - **Separates concerns** -- Researcher focuses on search quality, Analyst on design coherence, Reviewer on scientific rigor.
-- **Enables iterative refinement** -- Reviewer feedback loops prevent first-pass errors from propagating.
+- **Makes review explicit** -- the Reviewer's scores and verdict are written to a file. In this version they don't trigger revision, so first-pass errors can still get through (see below).
 - **Human-in-the-loop** -- The checkpoint between Phase 1 and Phase 2 prevents wasted compute on flawed architectures.
 
 #### Why CrewAI over Swarm
@@ -241,13 +239,30 @@ A single LLM call cannot reliably perform the full loop of literature search, wo
 | Dimension | CrewAI | OpenAI Swarm |
 |-----------|--------|--------------|
 | **Task structure** | Role-based sequential/hierarchical | Dynamic handoff, decentralized |
-| **Reflection** | Built-in reviewer loop | Manual implementation |
+| **Reflection** | Task chaining built in; a review-and-revise loop still has to be written (not done here) | Manual implementation |
 | **Memory** | Episodic memory built-in | No built-in memory |
 | **LLM flexibility** | Any provider (Grok, DeepSeek, OpenAI, Gemini) | OpenAI only |
 | **Best fit** | Structured research-design-code-review chains | Exploratory, parallel micro-agents |
 | **Production readiness** | Mature (45k+ GitHub stars, 2026) | Experimental |
 
-This project's workflow is inherently sequential and role-structured (research -> design -> review -> code -> review). CrewAI's role-based agent model and built-in reflection loops are a natural fit. Swarm's decentralized handoff model is better suited for open-ended exploration or parallel database queries -- a potential future extension for the Researcher agent.
+This project's workflow is inherently sequential and role-structured (research -> design -> review -> code -> review). CrewAI's role-based agent model is a natural fit. Swarm's decentralized handoff model is better suited for open-ended exploration or parallel database queries -- a potential future extension for the Researcher agent.
+
+#### What the Agent Got Wrong
+
+The one recorded Phase 1 run (`outputs/architecture_20260313_174532.md`, 60 s, GPT-4o for every agent) produced a design that the Reviewer scored 8.25/10 and passed. The design did not hold up against the real data, and the final per-UMI pipeline does not use it:
+
+| Agent design | Problem | Final design |
+|--------------|---------|--------------|
+| 8 bp UMI at the start of each read | Assumed. The agent was never given the data spec | 15 bp UMI in the `BX:Z:` tag |
+| UMI-tools dedup, then cluster the deduplicated reads | Dedup collapses each UMI to one read, which removes the reads needed to rebuild the molecule | Group reads by UMI, keep all of them, assemble each UMI (MEGAHIT) |
+| QIIME2 / DADA2 ASV denoising | Built for short amplicon reads, not for rebuilding a ~1500 bp molecule from ~10x coverage | Per-UMI de novo assembly, keep contigs of at least 1400 bp |
+| Quantile normalization for abundance | Abundance is compositional; quantile normalization forces samples onto the same distribution | Validate against the ZymoBIOMICS theoretical composition |
+
+Why this happened:
+- The Researcher only saw search snippets cut to 200 characters, and the Analyst only received a one-line task description. No agent read the existing code or the data spec.
+- The Reviewer used the same model as the Analyst and checked the design against general best practice, not against the data. It approved a design with wrong assumptions.
+
+The useful lesson: for architecture work, the gap was missing constraints, not a missing agent role. A reviewer that can't see the data can't catch a design that doesn't fit the data.
 
 #### Ongoing Work
 
